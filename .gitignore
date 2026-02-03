@@ -1,0 +1,9 @@
+# 大文件，不提交
+redroid-img/
+redroid-rootfs/
+redroid-rootfs.tar
+*.tar
+*.tar.gz
+
+# 临时文件
+temp.md
