@@ -77,8 +77,6 @@ uname -a
 
 ---
 
----
-
 ## 2026-02-03 获取 Android rootfs
 
 ### 问题
@@ -149,15 +147,6 @@ ls  # 验证文件存在
 
 ### 结果
 rootfs 成功传输到设备 `/data/android-rootfs/`
-
----
-
-## 待办
-
-- [x] 下载 redroid arm64 镜像
-- [x] 解包 OCI 镜像为 rootfs
-- [x] 传输 rootfs 到设备
-- [x] Android shell 启动成功
 
 ---
 
@@ -328,29 +317,6 @@ surfaceflinger 启动了，但：
 
 ---
 
-## 2026-02-03 阶段性总结
-
-### 已完成
-- [x] 技术方案确定：iSulad + 容器化 Android
-- [x] 环境检测：RK3568 + OH 6.0，内核支持 namespace/cgroup/binder
-- [x] Android rootfs 获取：redroid 13.0.0 arm64
-- [x] rootfs 传输到设备
-- [x] Android shell 启动成功
-- [x] Android 核心服务启动：servicemanager, hwservicemanager, logd, surfaceflinger
-
-### 待解决
-- [ ] 图形输出：surfaceflinger 需要与 OH 图形栈协调
-- [ ] logcat 不工作：logd socket 存在但 logcat 连接失败
-- [ ] 完整启动 init：让 Android 自动启动所有服务
-
-### 关键经验
-1. Android 13 依赖 APEX 模块，必须挂载 `/apex/com.android.runtime` 等
-2. 需要 tmpfs 挂载 `/data`，cgroup 挂载 `/dev/memcg`、`/dev/cpuctl`
-3. 设备节点需要手动创建：binder, hwbinder, vndbinder, tty, dri 等
-4. 两个图形系统不能同时控制同一个显示设备
-
----
-
 ## 2026-02-03 14:17 adbd 启动成功，adb 连接成功 ✓
 
 ### 问题
@@ -490,30 +456,6 @@ touch /data/android-rootfs/first_stage_ramdisk/fstab.redroid
 
 ---
 
-## 阶段性总结 (2026-02-03 15:00)
-
-### 已完成
-- [x] 技术方案：iSulad + 容器化 Android
-- [x] 环境检测：RK3568 + OH 6.0，内核支持容器特性
-- [x] rootfs 获取：redroid 13.0.0 arm64
-- [x] Android shell 启动
-- [x] 手动启动核心服务：servicemanager, hwservicemanager, logd, surfaceflinger
-- [x] adbd 启动并监听 5555 端口
-- [x] adb connect 成功
-
-### 未解决
-- [ ] adb 授权问题（property service 未运行）
-- [ ] init 完整启动（fstab/first stage mount 问题）
-- [ ] 图形输出
-
-### 关键发现
-1. redroid 启动参数：`/init qemu=1 androidboot.hardware=redroid`
-2. Android 13 APEX 依赖：必须挂载 runtime, art, i18n, conscrypt, adbd 等
-3. property service 需要 init 完整运行才能初始化
-4. 容器内 PID namespace 导致 kill 找不到进程
-
----
-
 ## 2026-02-03 15:10 尝试 patch adbd 绕过授权
 
 ### 尝试
@@ -579,6 +521,3 @@ adb 授权问题需要：
 1. 研究 redroid init 崩溃原因，解决 fstab/first stage mount 问题
 2. 或写启动脚本批量启动服务，绕过 init
 3. 或用 Docker 先验证 redroid 完整流程
-- [ ] 用 unshare 启动最小 Android init
-- [ ] 验证 Binder 驱动可用性
-- [ ] 图形输出方案验证
