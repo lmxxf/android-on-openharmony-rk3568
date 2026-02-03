@@ -511,6 +511,74 @@ touch /data/android-rootfs/first_stage_ramdisk/fstab.redroid
 2. Android 13 APEX 依赖：必须挂载 runtime, art, i18n, conscrypt, adbd 等
 3. property service 需要 init 完整运行才能初始化
 4. 容器内 PID namespace 导致 kill 找不到进程
+
+---
+
+## 2026-02-03 15:10 尝试 patch adbd 绕过授权
+
+### 尝试
+1. 找到 `ro.adb.secure` 字符串位置：
+```bash
+strings -t x /apex/com.android.adbd/bin/adbd | grep "ro.adb.secure"
+# 输出: 13b8a ro.adb.secure
+```
+
+2. 用 sed 替换：
+```bash
+cp /apex/com.android.adbd/bin/adbd /data/adbd_patched
+sed -i 's/ro\.adb\.secure/ro.adb.XXXXXXX/g' /data/adbd_patched
+```
+
+3. 验证替换成功：
+```bash
+strings /data/adbd_patched | grep -E "ro.adb.(secure|XXXXXXX)"
+# 输出: ro.adb.XXXXXXX
+```
+
+### 结果
+sed 替换破坏了 ELF 文件结构：
+```
+CANNOT LINK EXECUTABLE "/data/adbd_patched": empty/missing DT_HASH/DT_GNU_HASH
+```
+
+旧的 adbd 进程还在跑，但仍然检查授权 —— 说明 `ro.adb.secure` 不是唯一检查点。
+
+### 结论
+adb 授权问题需要：
+1. property service 正常运行（init 完整启动）
+2. 或重新编译 adbd 禁用授权
+3. 或使用修改过的 redroid 镜像
+
+**当前可行替代方案**：用 `hdc shell` + `chroot` 进入 Android，功能等价于 adb shell。
+
+---
+
+## 最终总结 (2026-02-03)
+
+### 已实现
+- [x] Android 13 rootfs 在 OpenHarmony 6.0 (RK3568) 上运行
+- [x] Android shell 可用（通过 hdc + chroot）
+- [x] 核心服务可手动启动：servicemanager, hwservicemanager, logd, surfaceflinger, adbd
+- [x] adbd 监听 tcp:5555，adb connect 成功
+
+### 未解决
+- [ ] adb 授权（需要 property service）
+- [ ] init 完整启动（SIGSEGV 崩溃）
+- [ ] 图形输出（surfaceflinger 没有控制显示设备）
+
+### 技术要点
+1. **APEX 挂载**：Android 13 必须挂载 runtime, art, i18n, conscrypt, adbd 等
+2. **redroid 启动参数**：`/init qemu=1 androidboot.hardware=redroid`
+3. **容器环境要求**：
+   - `/dev` tmpfs + 设备节点（binder, hwbinder, vndbinder, tty 等）
+   - `/proc`, `/sys`, `/dev/pts` 挂载
+   - `/data` tmpfs
+   - `/linkerconfig/ld.config.txt`
+
+### 下一步方向
+1. 研究 redroid init 崩溃原因，解决 fstab/first stage mount 问题
+2. 或写启动脚本批量启动服务，绕过 init
+3. 或用 Docker 先验证 redroid 完整流程
 - [ ] 用 unshare 启动最小 Android init
 - [ ] 验证 Binder 驱动可用性
 - [ ] 图形输出方案验证
