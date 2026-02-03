@@ -466,6 +466,51 @@ redroid 需要特定的内核参数：
 ```bash
 unshare --mount --pid --fork chroot /data/android-rootfs /init qemu=1 androidboot.hardware=redroid &
 ```
+
+### 结果
+init 进入 second stage 但仍然崩溃（返回码 139）。
+
+新的错误信息：
+```
+init: Failed to create FirstStageMount failed to read default fstab for first stage mount
+init: Failed to mount required partitions early ...
+init: init second stage started!
+```
+
+init 在找 fstab 文件失败。
+
+### 下一步
+创建空的 fstab 文件：
+```bash
+touch /data/android-rootfs/vendor/etc/fstab.redroid
+touch /data/android-rootfs/fstab.redroid
+mkdir -p /data/android-rootfs/first_stage_ramdisk
+touch /data/android-rootfs/first_stage_ramdisk/fstab.redroid
+```
+
+---
+
+## 阶段性总结 (2026-02-03 15:00)
+
+### 已完成
+- [x] 技术方案：iSulad + 容器化 Android
+- [x] 环境检测：RK3568 + OH 6.0，内核支持容器特性
+- [x] rootfs 获取：redroid 13.0.0 arm64
+- [x] Android shell 启动
+- [x] 手动启动核心服务：servicemanager, hwservicemanager, logd, surfaceflinger
+- [x] adbd 启动并监听 5555 端口
+- [x] adb connect 成功
+
+### 未解决
+- [ ] adb 授权问题（property service 未运行）
+- [ ] init 完整启动（fstab/first stage mount 问题）
+- [ ] 图形输出
+
+### 关键发现
+1. redroid 启动参数：`/init qemu=1 androidboot.hardware=redroid`
+2. Android 13 APEX 依赖：必须挂载 runtime, art, i18n, conscrypt, adbd 等
+3. property service 需要 init 完整运行才能初始化
+4. 容器内 PID namespace 导致 kill 找不到进程
 - [ ] 用 unshare 启动最小 Android init
 - [ ] 验证 Binder 驱动可用性
 - [ ] 图形输出方案验证
