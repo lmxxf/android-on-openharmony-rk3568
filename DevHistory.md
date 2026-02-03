@@ -495,29 +495,285 @@ adb 授权问题需要：
 
 ---
 
-## 最终总结 (2026-02-03)
+## 2026-02-03 15:30 二进制 Patch adbd 绕过授权
 
-### 已实现
+### 思路
+用 xxd 精确修改 adbd 二进制，绕过 auth 检查。
+
+### 分析过程
+
+1. 导出反汇编：
+```bash
+sudo apt install -y binutils-aarch64-linux-gnu
+aarch64-linux-gnu-objdump -d redroid-rootfs/system/apex/com.android.adbd/bin/adbd > /tmp/adbd.asm
+```
+
+2. 找到关键代码（adbd_main 函数）：
+```
+9a1bc:  adrp x9, 13000           # 加载 "ro.adb.secure" 地址
+9a1c4:  add x9, x9, #0xb8a
+9a1e8:  bl GetBoolProperty       # 读取 ro.adb.secure
+9a1f4:  and w9, w0, #0x1         # 取结果最低位
+9a1fc:  strb w9, [x10]           # 存储到 auth_required 全局变量
+```
+
+3. **Patch 1**：把 `and w9, w0, #0x1` 改成 `mov w9, wzr`（强制返回 0）
+```bash
+# 原指令: 12000009 (and w9, w0, #0x1)
+# 新指令: 2a1f03e9 (mov w9, wzr)
+printf '\xe9\x03\x1f\x2a' | dd of=adbd bs=1 seek=$((0x9a1f4)) conv=notrunc
+```
+
+4. **Patch 2**：发现还有第二道检查在 `handle_packet` 函数里
+```
+a131c:  ldrb w8, [x24]           # 加载 auth_required
+a1320:  tbnz w8, #0, a1938       # 如果 != 0，跳转到 auth 处理
+```
+
+把 `tbnz` 改成 `nop`：
+```bash
+# 原指令: 370030c8 (tbnz w8, #0, a1938)
+# 新指令: d503201f (nop)
+printf '\x1f\x20\x03\xd5' | dd of=adbd bs=1 seek=$((0xa1320)) conv=notrunc
+```
+
+### 结果
+Patch 后仍然显示 `prompting user to authorize key`。
+
+原因分析：auth 流程有多层检查，`adbd_auth_confirm_key` 函数会被调用，它直接请求用户授权，不经过 auth_required 检查。
+
+### 结论
+二进制 patch 方式太复杂，放弃。**adb 授权问题不是必须解决的**——`hdc shell` + `chroot` 功能上等价于 `adb shell`，足够用于调试。
+
+---
+
+## 2026-02-03 15:50 调试 init 崩溃
+
+### 关键发现：SELinux 导致问题
+
+dmesg 里大量 `avc: denied` 日志，OpenHarmony 的 SELinux 是 Enforcing 模式，阻止了 Android init 的操作。
+
+### 解决方案
+
+```bash
+# 检查 SELinux 状态
+getenforce
+# 输出: Enforcing
+
+# 临时关闭 SELinux
+setenforce 0
+getenforce
+# 输出: Permissive
+```
+
+### init 启动进展
+
+关闭 SELinux 后，init 可以跑到 second stage：
+
+```
+init: init first stage started!
+init: [libfs_mgr]ReadFstabFromDt(): failed to read fstab from dt
+init: [libfs_mgr]ReadDefaultFstab(): failed to find device default fstab
+init: Failed to create FirstStageMount failed to read default fstab for first stage mount
+init: Failed to mount required partitions early ...
+init: init second stage started!
+```
+
+但仍然返回 139 (SIGSEGV) 退出。
+
+### 当前卡点
+
+init 在 second stage 启动后崩溃，可能原因：
+1. fstab 文件格式不对（目前只有注释）
+2. 缺少某些必要的环境配置
+
+### 下一步
+修复 fstab 文件格式，继续调试 init second stage。
+
+---
+
+## 2026-02-03 16:20 用 strace 找到 init 崩溃根因
+
+### 分析过程
+
+用 strace 跟踪 init 崩溃：
+
+```bash
+unshare --mount --pid --fork chroot /data/android-rootfs /system/bin/strace -f -o /data/init_strace.log /init qemu=1 androidboot.hardware=redroid
+```
+
+### 发现
+
+strace 日志最后几行：
+```
+3     munmap(0x7f957e1000, 73240)       = 0
+3     munmap(0x7f95976000, 10520)       = 0
+3     --- SIGSEGV {si_signo=SIGSEGV, si_code=SEGV_MAPERR, si_addr=0x14} ---
+```
+
+**`si_addr=0x14`** = 空指针解引用（访问 NULL + 偏移量 20）
+
+init 在初始化 property system 时，所有 property 文件返回 `EEXIST`（已存在），导致某个指针没初始化就被使用。
+
+### 解决方案
+
+清空 `/dev/__properties__/` 目录，让 init 自己创建：
+
+```bash
+rm -rf /data/android-rootfs/dev/__properties__/*
+```
+
+### 结果
+
+清空后 init 进入 second stage 并开始正常运行！
+
+---
+
+## 2026-02-03 16:30 init second stage 启动成功 ✓
+
+### 突破性进展
+
+清空 `/dev/*` 后，init 成功进入 second stage 并开始初始化 property system：
+
+```
+init: init second stage started!
+init: Setting product property ro.product.brand to 'redroid'
+init: Setting product property ro.product.model to 'redroid13_arm64'
+init: Created socket '/dev/socket/property_service', mode 666
+```
+
+但崩溃在 remount 根文件系统：
+
+```
+init: Failed to remount / as 104000: Invalid argument
+init: SetupMountNamespaces failed: Invalid argument
+```
+
+### 解决 remount 问题
+
+清空 `/dev` 让 init 自己创建设备节点和挂载：
+
+```bash
+rm -rf /data/android-rootfs/dev/*
+unshare --mount --pid --fork chroot /data/android-rootfs /init qemu=1 androidboot.hardware=redroid
+```
+
+### 新问题：vold 崩溃
+
+init 成功启动了大量服务：
+- system_suspend
+- keystore2
+- vendor.keymaster-4-1
+- mediametrics, media, storaged, wificond
+- vendor.media.omx, vendor.ril-daemon
+- media.swcodec, statsd, gatekeeperd, apexd
+
+但 vold (Volume Daemon) 崩溃导致系统重启：
+
+```
+init: Service 'vold' (pid 93) received signal 6
+init: Service with 'reboot_on_failure' option failed, shutting down system.
+init: Got shutdown_command 'reboot,vold-failed'
+```
+
+### 禁用 vold
+
+vold 需要真实的块设备，我们容器里没有。禁用它：
+
+```bash
+# 禁用 vold.rc
+mv /data/android-rootfs/system/etc/init/vold.rc /data/android-rootfs/system/etc/init/vold.rc.disabled
+
+# 注释掉 init.rc 里的 start vold
+sed -i 's/^    start vold/#    start vold/' /data/android-rootfs/system/etc/init/hw/init.rc
+sed -i 's/^  start vold/#  start vold/' /data/android-rootfs/system/etc/init/hw/init.rc
+```
+
+### 当前状态
+
+init 已经能启动大量 Android 服务，vold 是最后一个阻塞问题。
+
+---
+
+## 2026-02-03 16:50 彻底禁用 vold，init 持续运行成功！ ✓✓✓
+
+### 问题分析
+
+禁用 vold.rc 后，init 仍然报 `vold-failed` 重启。原因：
+1. `vold.rc.disabled` 后缀的文件仍然被 init 解析（init 会读取所有 .rc 文件）
+2. vold.rc 里有 `reboot_on_failure reboot,vold-failed` 设置
+
+### 最终解决方案
+
+彻底删除 vold 相关文件：
+
+```bash
+# 删除 vold.rc（不能只是改名！）
+rm -f /data/android-rootfs/system/etc/init/vold.rc.disabled
+
+# 删除 vold 可执行文件
+mv /data/android-rootfs/system/bin/vold /data/android-rootfs/system/bin/vold.disabled
+
+# 注释掉 init.rc 里的 start vold
+sed -i 's/^    start vold/#    start vold/' /data/android-rootfs/system/etc/init/hw/init.rc
+sed -i 's/^  start vold/#  start vold/' /data/android-rootfs/system/etc/init/hw/init.rc
+```
+
+### 结果
+
+**🎉🎉🎉 init 持续运行，不再退出！**
+
+启动命令：
+```bash
+rm -rf /data/android-rootfs/dev/*
+unshare --mount --pid --fork chroot /data/android-rootfs /init qemu=1 androidboot.hardware=redroid
+```
+
+启动的服务列表（部分）：
+- vendor.audio-hal
+- vendor.bluetooth-1-1
+- vendor.gralloc-2-0
+- vendor.hwcomposer-2-1
+- vendor.health-default
+- vendor.wifi_hal_legacy
+- audioserver
+- servicemanager
+- surfaceflinger
+- credstore
+- gpu
+- ...
+
+---
+
+## 当前状态总结 (2026-02-03 16:50)
+
+### 已实现 ✅
 - [x] Android 13 rootfs 在 OpenHarmony 6.0 (RK3568) 上运行
 - [x] Android shell 可用（通过 hdc + chroot）
-- [x] 核心服务可手动启动：servicemanager, hwservicemanager, logd, surfaceflinger, adbd
-- [x] adbd 监听 tcp:5555，adb connect 成功
+- [x] SELinux 临时禁用（setenforce 0）
+- [x] **init 完整启动成功！** 🎉
+- [x] Property service 初始化成功
+- [x] 大量 Android 服务成功启动
 
 ### 未解决
-- [ ] adb 授权（需要 property service）
-- [ ] init 完整启动（SIGSEGV 崩溃）
-- [ ] 图形输出（surfaceflinger 没有控制显示设备）
+- [ ] adb 授权（init 跑起来后 property service 正常，可能现在能解决）
+- [ ] 图形输出（surfaceflinger 启动了但没有显示）
 
-### 技术要点
-1. **APEX 挂载**：Android 13 必须挂载 runtime, art, i18n, conscrypt, adbd 等
-2. **redroid 启动参数**：`/init qemu=1 androidboot.hardware=redroid`
-3. **容器环境要求**：
-   - `/dev` tmpfs + 设备节点（binder, hwbinder, vndbinder, tty 等）
-   - `/proc`, `/sys`, `/dev/pts` 挂载
-   - `/data` tmpfs
-   - `/linkerconfig/ld.config.txt`
+### 关键技术发现
 
-### 下一步方向
-1. 研究 redroid init 崩溃原因，解决 fstab/first stage mount 问题
-2. 或写启动脚本批量启动服务，绕过 init
-3. 或用 Docker 先验证 redroid 完整流程
+1. **SELinux 必须关闭**：`setenforce 0`
+2. **`/dev/` 必须清空**：让 init 自己创建设备节点
+3. **vold 必须彻底删除**：
+   - 删除 `/system/etc/init/vold.rc`（不能改名！）
+   - 删除 `/system/bin/vold`
+   - 注释掉 init.rc 里的 `start vold`
+
+4. **启动命令**：
+   ```bash
+   rm -rf /data/android-rootfs/dev/*
+   unshare --mount --pid --fork chroot /data/android-rootfs /init qemu=1 androidboot.hardware=redroid
+   ```
+
+### 下一步
+1. 验证 adb 授权是否能通过（property service 现在正常了）
+2. 研究图形输出方案
